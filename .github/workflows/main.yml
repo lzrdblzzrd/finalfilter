@@ -1,0 +1,148 @@
+name: сборка набора правил finalfilter
+
+on:
+  schedule:
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: компиляция и публикация
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: клонирование репозитория
+        uses: actions/checkout@v6
+
+      - name: инициализация чистой ветки
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          current_commit=$(git rev-parse HEAD)
+          git checkout --orphan temp
+          git rm -rfq .
+          git checkout "$current_commit" -- .github/workflows
+
+      - name: установка sing-box
+        run: curl -fsSL https://sing-box.app/install.sh | sh
+
+      - name: загрузка и компиляция правил
+        run: |
+          sources=(
+            "https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/community.lst"
+            "https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/community_ips.lst"
+            "https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/discord_ips.lst"
+            "https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/domains_all.lst"
+            "https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/ipsum.lst"
+            "https://raw.githubusercontent.com/1andrevich/Re-filter-lists/refs/heads/main/ooni_domains.lst"
+            "https://community.antifilter.download/list/community.lst"
+            "https://community.antifilter.download/list/domains.lst"
+          )
+
+          curl -sL "${sources[@]}" > all_sources.txt
+
+          cat all_sources.txt | \
+            grep -oP '(?i)(?:(?<![a-zA-Z0-9._\-])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:/(?:3[0-2]|[1-2]?\d))?|(?<![a-zA-Z0-9._\-:])(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,7}:|(?:[a-fA-F0-9]{1,4}:){1,6}:[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:){1,5}(?::[a-fA-F0-9]{1,4}){1,2}|(?:[a-fA-F0-9]{1,4}:){1,4}(?::[a-fA-F0-9]{1,4}){1,3}|(?:[a-fA-F0-9]{1,4}:){1,3}(?::[a-fA-F0-9]{1,4}){1,4}|(?:[a-fA-F0-9]{1,4}:){1,2}(?::[a-fA-F0-9]{1,4}){1,5}|[a-fA-F0-9]{1,4}:(?:(?::[a-fA-F0-9]{1,4}){1,6})|:(?:(?::[a-fA-F0-9]{1,4}){1,7}|:))(?:/(?:12[0-8]|1[0-1]\d|[1-9]?\d))?)' | \
+            python3 -c "
+          import sys
+          import ipaddress
+
+          inc_v4 = []
+          inc_v6 = []
+
+          for line in sys.stdin:
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  net = ipaddress.ip_network(line, strict=False)
+                  if net.version == 4:
+                      inc_v4.append(net)
+                  else:
+                      inc_v6.append(net)
+              except ValueError:
+                  pass
+
+          for addr in ipaddress.collapse_addresses(inc_v4):
+              print(addr)
+
+          for addr in ipaddress.collapse_addresses(inc_v6):
+              print(addr)
+          " > ips.txt
+
+          cat all_sources.txt | \
+            grep -oP '^(?:\x{FEFF})?\s*(?:[\x22\x27])?(?:@@\|\||\|\|)?(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|::1)?\s*(?:[a-zA-Z]+://)?(?:[^@/\s]+@)?\K(?:[a-zA-Z0-9\p{L}](?:[a-zA-Z0-9\p{L}-]{0,61}[a-zA-Z0-9\p{L}])?\.)+[a-zA-Z\p{L}][a-zA-Z0-9\p{L}-]{0,61}[a-zA-Z0-9\p{L}](?=[/;:?#\^$\s,]|\x22|\x27|$)' | \
+            awk '{ print tolower($0) }' | \
+            sed -E 's/^(www\.)+//' | \
+            sort -u > domains.txt
+
+          jq -R . < ips.txt | jq -s 'map(select(length > 0))' > ips.json
+          jq -R . < domains.txt | jq -s 'map(select(length > 0))' > domains.json
+
+          jq -n \
+            --slurpfile ips ips.json \
+            --slurpfile domains domains.json \
+            '{
+              version: 1,
+              rules:[
+                {
+                  ip_cidr: $ips[0],
+                  domain_suffix: $domains[0]
+                }
+              ]
+            }' > finalfilter.json
+
+          sing-box rule-set compile finalfilter.json -o finalfilter.srs
+
+          {
+            echo '# использование в sing-box'
+            echo '```json'
+            echo '{'
+            echo '  "route": {'
+            echo '    "rules": ['
+            echo '      {'
+            echo '        "rule_set": "finalfilter",'
+            echo '        "outbound": "proxy"'
+            echo '      }'
+            echo '    ],'
+            echo '    "rule_set": ['
+            echo '      {'
+            echo '        "type": "remote",'
+            echo '        "tag": "finalfilter",'
+            echo '        "url": "https://github.com/lzrdblzzrd/finalfilter/raw/refs/heads/main/finalfilter.srs"'
+            echo '      }'
+            echo '    ]'
+            echo '  }'
+            echo '}'
+            echo '```'
+            echo ''
+            echo '## статистика'
+            echo "- **дата последнего обновления:** $(TZ='Europe/Moscow' date +'%d.%m.%Y %H:%M')"
+            echo "- **ip-адреса и подсети:** $(wc -l < ips.txt)"
+            echo "- **домены:** $(wc -l < domains.txt)"
+            echo ''
+            echo '## источники'
+            
+            for src in "${sources[@]}"; do
+              echo "- $src"
+            done
+          } > readme.md
+
+      - name: публикация набора правил
+        run: |
+          git add readme.md finalfilter.srs .github/workflows
+          git commit -m "$(TZ='Europe/Moscow' date +'%d.%m.%Y %H:%M')"
+          git push -f origin temp:main
+
+      - name: удаление старых запусков workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/actions/runs \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | .id' | \
+            xargs -I{} gh api -X DELETE repos/${{ github.repository }}/actions/runs/{}
